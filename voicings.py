@@ -10,14 +10,17 @@ Each string has a value:
    n  -> pressed at fret n (1..)
 """
 
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
 from chord_parser import (
     ParsedChord, semitone_to_name, NOTE_TO_SEMITONE,
     NOTE_NAMES_SHARP, QUALITY_DEFS,
 )
-from external_data import load_all_external
+from external_data import Barre, load_all_external
+
+logger = logging.getLogger(__name__)
 
 
 # Standard tuning. Index 0 = high e (1st string), Index 5 = low E (6th string).
@@ -41,10 +44,15 @@ class Voicing:
       -1 = muted
        0 = open
        n = fret n
+
+    fingers and barres come from external data only and are None when unknown
+    (never inferred); they do not take part in signature().
     """
     frets: List[int]                         # length 6, index 0 = high e
     source: str = "db"                       # "db" or "auto"
     base_fret: int = 1                       # starting fret to render (1 if includes open/low frets)
+    fingers: Optional[Tuple[int, ...]] = None  # length 6, index 0 = high e; 0 = no finger, 1-4 = finger
+    barres: Optional[Tuple[Barre, ...]] = None  # () = data says no barre
 
     def fingered_frets(self) -> List[int]:
         return [f for f in self.frets if f > 0]
@@ -106,7 +114,7 @@ VOICING_DB: dict[Tuple[str, str, Optional[str]], List[List[int]]] = {
     # Minor triads (open shapes)
     ("A", "min", None): [
         [0, 1, 2, 2, 0, -1],     # open Am
-        [5, 6, 7, 7, 5, -1],     # A-shape minor barre at 5
+        [5, 5, 5, 7, 7, 5],      # E-shape minor barre at 5
     ],
     ("D", "min", None): [
         [1, 3, 2, 0, -1, -1],    # open Dm
@@ -160,15 +168,47 @@ VOICING_DB: dict[Tuple[str, str, Optional[str]], List[List[int]]] = {
 # DB so db_lookup can serve them uniformly.
 # ---------------------------------------------------------------------------
 
-_EXTERNAL_INDEX: dict[Tuple[str, str, Optional[str]], List[Tuple[Tuple[int, ...], str]]] = {}
+# Value tuples: (fret signature, source tag, fingers or None, barres or None).
+_EXTERNAL_INDEX: dict[
+    Tuple[str, str, Optional[str]],
+    List[Tuple[Tuple[int, ...], str, Optional[Tuple[int, ...]], Optional[Tuple[Barre, ...]]]],
+] = {}
 _EXTERNAL_LOADED: bool = False
+
+_QUALITY_INTERVALS: dict[str, List[int]] = dict(QUALITY_DEFS)
+# A 13th chord legitimately contains the 11th; QUALITY_DEFS merely omits it.
+_EXTRA_ALLOWED_INTERVALS: dict[str, List[int]] = {"13": [17], "maj13": [17]}
+
+
+def _allowed_pitch_classes(root: str, quality: str, bass: Optional[str]) -> Optional[frozenset[int]]:
+    """Chord tones plus slash bass for a key, or None when the parser cannot produce it."""
+    intervals = _QUALITY_INTERVALS.get(quality)
+    root_pc = NOTE_TO_SEMITONE.get(root)
+    if intervals is None or root_pc is None:
+        return None
+    allowed = {(root_pc + iv) % 12 for iv in intervals + _EXTRA_ALLOWED_INTERVALS.get(quality, [])}
+    if bass is not None and bass in NOTE_TO_SEMITONE:
+        allowed.add(NOTE_TO_SEMITONE[bass])
+    return frozenset(allowed)
+
+
+def _fits_chord(frets: List[int], allowed: Optional[frozenset[int]]) -> bool:
+    """Return True if every sounded pitch class is in `allowed` (from _allowed_pitch_classes).
+
+    allowed=None (quality or root the parser cannot produce) always passes; those
+    entries are unreachable anyway.
+    """
+    if allowed is None:
+        return True
+    return all((OPEN_STRING_SEMITONES[i] + f) % 12 in allowed for i, f in enumerate(frets) if f >= 0)
 
 
 def _build_external_index() -> None:
     """Load external JSON datasets once and index them by (root, quality, bass).
 
-    Failures (missing or malformed files) are silent: the program still works
-    with just the built-in DB and the generator.
+    Failures (malformed or unreadable files) are logged; the program still works
+    with just the built-in DB and the generator. Voicings that sound notes outside
+    their chord (dataset errors) are dropped and counted in one log record.
     """
     global _EXTERNAL_LOADED
     if _EXTERNAL_LOADED:
@@ -177,17 +217,29 @@ def _build_external_index() -> None:
     try:
         entries = load_all_external()
     except Exception:
+        logger.exception("Failed to load external chord data; using built-in DB only.")
         return
 
     seen_per_key: dict[Tuple[str, str, Optional[str]], set] = {}
+    allowed_per_key: dict[Tuple[str, str, Optional[str]], Optional[frozenset[int]]] = {}
+    dropped = 0
     for e in entries:
         key = (e["root"], e["quality"], e["bass"])
+        if key not in allowed_per_key:
+            allowed_per_key[key] = _allowed_pitch_classes(*key)
+        if not _fits_chord(e["frets"], allowed_per_key[key]):
+            dropped += 1
+            continue
         sig = tuple(e["frets"])
         seen = seen_per_key.setdefault(key, set())
         if sig in seen:
             continue
         seen.add(sig)
-        _EXTERNAL_INDEX.setdefault(key, []).append((sig, e["source"]))
+        _EXTERNAL_INDEX.setdefault(key, []).append(
+            (sig, e["source"], e.get("fingers"), e.get("barres"))
+        )
+    if dropped:
+        logger.warning("Dropped %d external voicings that sound notes outside their chord", dropped)
 
 
 def db_lookup(parsed: ParsedChord) -> List[Voicing]:
@@ -209,6 +261,9 @@ def db_lookup(parsed: ParsedChord) -> List[Voicing]:
 
     voicings: List[Voicing] = []
     seen: set[Tuple[int, ...]] = set()
+    external = _EXTERNAL_INDEX.get(key, [])
+    # Built-in shapes have no fingering; borrow it from the identical external shape.
+    external_fingering = {sig: (fingers, barres) for sig, _, fingers, barres in external}
 
     # 1. Built-in curated DB
     for frets in VOICING_DB.get(key, []):
@@ -216,16 +271,17 @@ def db_lookup(parsed: ParsedChord) -> List[Voicing]:
         if sig in seen:
             continue
         seen.add(sig)
-        v = Voicing(frets=list(frets), source="db")
+        fingers, barres = external_fingering.get(sig, (None, None))
+        v = Voicing(frets=list(frets), source="db", fingers=fingers, barres=barres)
         v.base_fret = _compute_base_fret(v)
         voicings.append(v)
 
     # 2. External datasets
-    for sig, source_tag in _EXTERNAL_INDEX.get(key, []):
+    for sig, source_tag, fingers, barres in external:
         if sig in seen:
             continue
         seen.add(sig)
-        v = Voicing(frets=list(sig), source=source_tag)
+        v = Voicing(frets=list(sig), source=source_tag, fingers=fingers, barres=barres)
         v.base_fret = _compute_base_fret(v)
         voicings.append(v)
 
@@ -453,7 +509,81 @@ _QUALITY_DISPLAY: dict[str, str] = {
     "sus4": "sus4", "add9": "add9", "dim7": "dim7",  "min7b5": "m7b5",
     "aug7": "aug7", "dim": "dim",   "aug": "aug",    "13": "13",
     "11": "11",     "9": "9",       "6": "6",        "5": "5",
+    "min6": "m6",   "min11": "m11", "minadd9": "madd9", "min69": "m69",
+    "maj7b5": "M7b5", "maj7#5": "M7#5", "maj7sus2": "M7sus2",
+    "maj11": "M11", "maj13": "M13",
 }
+
+# Fallback (non-exact) matching only considers the qualities ranked above, in
+# QUALITY_DEFS order; the qualities appended later take part in exact matches only.
+_FALLBACK_QUALITIES: list[tuple[str, list[int]]] = [
+    (token, intervals) for token, intervals in QUALITY_DEFS
+    if token in _QUALITY_FALLBACK_PRIORITY
+]
+
+
+def _played_pitch_classes(fret_inputs: List[Optional[int]]) -> Tuple[Set[int], Optional[int]]:
+    """Pitch classes sounded by fret_inputs (e..E, None = not played) and the bass pitch class."""
+    played_pcs: Set[int] = set()
+    bass_pc: Optional[int] = None
+    for string_idx, fret in enumerate(fret_inputs):
+        if fret is not None:
+            pc = (OPEN_STRING_SEMITONES[string_idx] + fret) % 12
+            played_pcs.add(pc)
+            # Iterating 0→5 means the last assigned bass_pc is the lowest string played.
+            bass_pc = pc
+    return played_pcs, bass_pc
+
+
+def _make_parsed(root_pc: int, token: str, intervals: List[int]) -> ParsedChord:
+    """ParsedChord for a reverse-lookup result, named with the user-facing suffix."""
+    root_name = NOTE_NAMES_SHARP[root_pc]
+    return ParsedChord(
+        raw=root_name + _QUALITY_DISPLAY.get(token, token),
+        root=root_name,
+        root_semitone=root_pc,
+        quality=token,
+        intervals=list(intervals),
+    )
+
+
+def _ranked_exact_matches(played_pcs: Set[int], bass_pc: Optional[int]) -> List[ParsedChord]:
+    """Every chord (all QUALITY_DEFS) whose pitch classes equal played_pcs, best first."""
+    exact_candidates = []
+    for root_pc in range(12):
+        for token, intervals in QUALITY_DEFS:
+            chord_pcs = {(root_pc + iv) % 12 for iv in intervals}
+            if played_pcs == chord_pcs:
+                # Last element: on a full tie the original qualities keep winning,
+                # so appended qualities only take over when strictly better.
+                score = (
+                    1 if bass_pc == root_pc else 0,
+                    -len(intervals),
+                    1 if token in _QUALITY_FALLBACK_PRIORITY else 0,
+                )
+                exact_candidates.append((score, _make_parsed(root_pc, token, intervals)))
+    exact_candidates.sort(key=lambda x: x[0], reverse=True)   # stable: ties keep generation order
+    return [parsed for _, parsed in exact_candidates]
+
+
+def identify_exact_chords(fret_inputs: List[Optional[int]]) -> List[ParsedChord]:
+    """List every exact-match chord name for the given frets, best first.
+
+    Uses the same scoring as identify_chord_from_frets, whose exact result is
+    always the first element. Fallback (subset) matches are not included.
+
+    Args:
+        fret_inputs: 6 elements ordered e, B, G, D, A, E (high → low string).
+                     None = string not played. 0 = open string. n>0 = fret n.
+
+    Returns:
+        Ranked ParsedChords; empty when fewer than 2 distinct pitch classes
+        are played or no chord matches exactly.
+    """
+    played_pcs, bass_pc = _played_pitch_classes(fret_inputs)
+    if len(played_pcs) < 2:
+        return []
+    return _ranked_exact_matches(played_pcs, bass_pc)
 
 
 def identify_chord_from_frets(
@@ -462,10 +592,11 @@ def identify_chord_from_frets(
     """Identify the chord whose pitch-class set best matches the given frets.
 
     Strategy:
-      1. Exact match  – played pitch classes == chord pitch classes.
-      2. Fallback     – played pitch classes ⊂ chord pitch classes
+      1. Exact match  – played pitch classes == chord pitch classes (all QUALITY_DEFS).
+      2. Fallback     – played pitch classes ⊂ chord pitch classes (_FALLBACK_QUALITIES only)
          (used only when no exact match exists).
-    Tie-breaking: root == bass note first, then simplest chord (fewest tones).
+    Tie-breaking: root == bass note first, then simplest chord (fewest tones);
+    exact ties go to the original (non-appended) qualities.
 
     Args:
         fret_inputs: 6 elements ordered e, B, G, D, A, E (high → low string).
@@ -475,46 +606,19 @@ def identify_chord_from_frets(
         (ParsedChord, is_exact) where is_exact is True for an exact match,
         or None if fewer than 2 distinct pitch classes are provided.
     """
-    played_pcs: Set[int] = set()
-    bass_pc: Optional[int] = None
-
-    for string_idx, fret in enumerate(fret_inputs):
-        if fret is not None:
-            pc = (OPEN_STRING_SEMITONES[string_idx] + fret) % 12
-            played_pcs.add(pc)
-            # Iterating 0→5 means the last assigned bass_pc is the lowest string played.
-            bass_pc = pc
-
+    played_pcs, bass_pc = _played_pitch_classes(fret_inputs)
     if len(played_pcs) < 2:
         return None
 
-    def _make_parsed(root_pc: int, token: str, intervals: List[int]) -> ParsedChord:
-        root_name = NOTE_NAMES_SHARP[root_pc]
-        return ParsedChord(
-            raw=root_name + _QUALITY_DISPLAY.get(token, token),
-            root=root_name,
-            root_semitone=root_pc,
-            quality=token,
-            intervals=list(intervals),
-        )
-
     # Phase 1: exact match (played_pcs == chord_pcs)
-    exact_candidates = []
-    for root_pc in range(12):
-        for token, intervals in QUALITY_DEFS:
-            chord_pcs = {(root_pc + iv) % 12 for iv in intervals}
-            if played_pcs == chord_pcs:
-                score = (1 if bass_pc == root_pc else 0, -len(intervals))
-                exact_candidates.append((score, _make_parsed(root_pc, token, intervals)))
-
-    if exact_candidates:
-        exact_candidates.sort(key=lambda x: x[0], reverse=True)
-        return exact_candidates[0][1], True
+    exact = _ranked_exact_matches(played_pcs, bass_pc)
+    if exact:
+        return exact[0], True
 
     # Phase 2: fallback – played_pcs ⊆ chord_pcs
     fallback_candidates = []
     for root_pc in range(12):
-        for token, intervals in QUALITY_DEFS:
+        for token, intervals in _FALLBACK_QUALITIES:
             chord_pcs = {(root_pc + iv) % 12 for iv in intervals}
             if played_pcs.issubset(chord_pcs):
                 score = (
@@ -534,6 +638,18 @@ def identify_chord_from_frets(
 
 if __name__ == "__main__":
     from chord_parser import parse_chord
+
+    # Self-check: every curated shape must sound only chord tones and include the root.
+    _quality_intervals = dict(QUALITY_DEFS)
+    for (_root, _quality, _bass), _shapes in VOICING_DB.items():
+        _tones = {(NOTE_TO_SEMITONE[_root] + iv) % 12 for iv in _quality_intervals[_quality]}
+        for _frets in _shapes:
+            _pcs = {(OPEN_STRING_SEMITONES[i] + f) % 12 for i, f in enumerate(_frets) if f >= 0}
+            assert _pcs <= _tones and NOTE_TO_SEMITONE[_root] in _pcs, (
+                f"VOICING_DB{(_root, _quality, _bass)} shape {_frets} sounds "
+                f"{sorted(semitone_to_name(p) for p in _pcs)}"
+            )
+    print(f"VOICING_DB self-check OK ({sum(len(v) for v in VOICING_DB.values())} shapes)")
     for s in ["C", "Cm", "G", "Am", "F", "CM7", "C/G"]:
         p = parse_chord(s)
         vs = get_voicings(p, source="both", max_results=6)

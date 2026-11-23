@@ -25,6 +25,7 @@ _SYMBOL_ALIASES: list[tuple[str, str]] = [
     ("°", "dim"),  # C° = Cdim
     ("ø", "m7b5"), # Cø = Cm7b5 (half-diminished)
     ("+", "aug"),  # C+ = Caug, C+7 = Caug7
+    ("6/9", "69"), # C6/9 = C69; must run before the slash-chord split ("/9" is never a valid bass)
 ]
 
 # '-' immediately after a root note (A-G optionally followed by # or b) means minor.
@@ -53,6 +54,7 @@ def _preprocess_input(s: str) -> str:
         Cø                -> Cm7b5     (half-diminished)
         C+, C+7           -> Caug, Caug7
         C-7, Bb-          -> Cm7, Bbm  (dash for minor)
+        C6/9, Cm6/9       -> C69, Cm69
         Cmajor7, Cminor7  -> Cmaj7, Cmin7
         Caugmented        -> Caug
         Cdiminished       -> Cdim
@@ -122,6 +124,28 @@ QUALITY_DEFS = [
     ("7",     [0, 4, 7, 10]),
     ("6",     [0, 4, 7, 9]),
     ("5",     [0, 7]),                 # power chord
+    # Qualities present in the external datasets. Appended (not interleaved) so
+    # identify_chord_from_frets keeps its existing tie-breaking order.
+    ("min6",     [0, 3, 7, 9]),
+    ("min11",    [0, 3, 7, 10, 14, 17]),
+    ("minadd9",  [0, 3, 7, 14]),
+    ("min69",    [0, 3, 7, 9, 14]),
+    ("add11",    [0, 4, 7, 17]),
+    ("69",       [0, 4, 7, 9, 14]),
+    ("7sus4",    [0, 5, 7, 10]),
+    ("7sus2",    [0, 2, 7, 10]),
+    ("sus2sus4", [0, 2, 5, 7]),
+    ("7b5",      [0, 4, 6, 10]),
+    ("7b9",      [0, 4, 7, 10, 13]),
+    ("7#9",      [0, 4, 7, 10, 15]),
+    ("9b5",      [0, 4, 6, 10, 14]),
+    ("9#11",     [0, 4, 7, 10, 14, 18]),
+    ("aug9",     [0, 4, 8, 10, 14]),
+    ("maj7b5",   [0, 4, 6, 11]),
+    ("maj7#5",   [0, 4, 8, 11]),
+    ("maj7sus2", [0, 2, 7, 11]),
+    ("maj11",    [0, 4, 7, 11, 14, 17]),
+    ("maj13",    [0, 4, 7, 11, 14, 21]),  # 11th omitted, same convention as "13"
 ]
 
 
@@ -178,6 +202,9 @@ def _parse_quality(s: str, pos: int) -> tuple[str, List[int], int]:
         # Disallow 'mM' combo per spec; here we only handle starts-with-M.
         normalized = "maj" + normalized[1:]
     elif normalized.startswith("m") and len(normalized) > 1 and normalized[1].isdigit():
+        normalized = "min" + normalized[1:]
+    elif normalized.startswith("madd"):
+        # Cmadd9 -> minadd9 ("maj..." never starts with "madd", so no clash).
         normalized = "min" + normalized[1:]
 
     # Match against QUALITY_DEFS (longest token first by definition order).

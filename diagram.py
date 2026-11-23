@@ -30,11 +30,17 @@ DEFAULT_FRET_COUNT = 3
 MAX_FRET_COUNT = 5
 
 
-def _decide_render_window(v: Voicing) -> Tuple[int, int]:
-    """Return (start_fret, num_frets_displayed).
+def decide_render_window(v: Voicing) -> Tuple[int, int]:
+    """Choose the fret window shared by the text and graphic diagrams.
 
     Policy: default 3 frets; expand to 4 or at most 5 as needed to show
     all fingered positions.
+
+    Args:
+        v: Voicing to display.
+
+    Returns:
+        (start_fret, num_frets_displayed).
     """
     fingered = v.fingered_frets()
     if not fingered:
@@ -60,7 +66,7 @@ def _left_marker(f: int) -> str:
 
 def render_left(v: Voicing) -> str:
     """Render the fretboard diagram (left side)."""
-    start, n = _decide_render_window(v)
+    start, n = decide_render_window(v)
     lines: List[str] = []
 
     for s_idx, name in enumerate(STRING_NAMES):
