@@ -27,10 +27,6 @@ NOTE_NAME_NORMALIZE = {
     "Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#",  # flats -> sharps (canonical)
 }
 
-SHARP_TO_FLAT = {
-    "C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb",
-}
-
 
 def _norm_root(s: str) -> str:
     """Normalize a root note string to the canonical sharp form (C, C#, D, ..., B).

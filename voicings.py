@@ -347,7 +347,7 @@ def generate_voicings(parsed: ParsedChord, max_results: int = 12) -> List[Voicin
         # or any fret in [start..start+span-1] (>=1).
         # We include open (0) always; bare open is musically natural even when window is high.
         per_string_choices: List[List[int]] = []
-        for s_idx in range(6):
+        for _ in range(6):
             choices = [-1, 0]
             for fret in range(max(1, start), start + span):
                 choices.append(fret)
@@ -390,7 +390,7 @@ def _search(
         if len(results) >= max_results:
             return
         if idx == 6:
-            _evaluate(current[:], per_string_choices, required_pcs, bass_pc, results, seen)
+            _evaluate(current[:], required_pcs, bass_pc, results, seen)
             return
         for choice in per_string_choices[idx]:
             if choice >= 0:
@@ -406,7 +406,6 @@ def _search(
 
 def _evaluate(
     frets: List[int],
-    per_string_choices: List[List[int]],
     required_pcs: Set[int],
     bass_pc: int,
     results: List[Voicing],

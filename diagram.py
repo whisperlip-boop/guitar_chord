@@ -161,24 +161,6 @@ def _center_pad(text: str, width: int, pad: str = "-") -> str:
     return pad * left + text + pad * right
 
 
-def render_both(v: Voicing, parsed: ParsedChord, gap: int = 4) -> str:
-    """Render left and right diagrams side by side, aligned line-by-line."""
-    left = render_left(v).split("\n")
-    right = render_right(v, parsed).split("\n")
-
-    # Pad both to the same number of lines
-    n = max(len(left), len(right))
-    left += [""] * (n - len(left))
-    right += [""] * (n - len(right))
-
-    left_width = max(len(line) for line in left) if left else 0
-    spacer = " " * gap
-    out_lines = []
-    for line_l, line_r in zip(left, right):
-        out_lines.append(f"{line_l:<{left_width}}{spacer}{line_r}")
-    return "\n".join(out_lines)
-
-
 if __name__ == "__main__":
     from chord_parser import parse_chord
     from voicings import get_voicings
@@ -189,4 +171,6 @@ if __name__ == "__main__":
         print(f"\n========== {s} ==========")
         for i, v in enumerate(vs):
             print(f"\n--- voicing {i+1}/{len(vs)} (source={v.source}, base_fret={v.base_fret}) ---")
-            print(render_both(v, p))
+            print(render_left(v))
+            print()
+            print(render_right(v, p))
